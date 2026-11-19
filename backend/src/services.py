@@ -10,14 +10,21 @@ def get(s,cls,id):
     return v
 def pack(v):return {c.name:getattr(v,c.name) for c in v.__table__.columns}
 def selected(s,lid):return list(s.scalars(select(LayoutProbe.probe_id).where(LayoutProbe.layout_id==lid).order_by(LayoutProbe.probe_id)))
-def pack_layout(s,l):return pack(l)|{'probe_ids':selected(s,l.id)}
+def pack_layout(s,l):
+    from .backup_service import layout_decorations
+    return pack(l)|{'probe_ids':selected(s,l.id)}|layout_decorations(s,l)
 def pack_sweep(s,x):
     return pack(x)|{'pressures':{probe.code:pressure.pascal for pressure,probe in s.execute(select(Pressure,Probe).join(Probe,Probe.id==Pressure.probe_id).where(Pressure.sweep_id==x.id))}}
 def audit(s,u,action):s.add(Audit(actor=u.email,action=action,stamp=datetime.now(timezone.utc).isoformat()))
 def invalidate(s):
     if s.scalar(select(Layout.id).where(Layout.status=='signed')):raise HTTPException(409,'已有审签布置，标定与扫角来源已冻结')
     if s.scalar(select(Layout.id).where(Layout.status=='calculating')):raise HTTPException(409,'贡献计算进行中，来源暂不能修改')
-    for l in s.scalars(select(Layout).where(Layout.status.in_(['ready','failed']))):l.status='invalidated';l.evidence=None;l.source_checksum=None
+    invalidate_pending(s)
+
+def invalidate_pending(s):
+    # 停用测点只影响尚未审签的方案；已签布置与来源保持已签原样。
+    for l in s.scalars(select(Layout).where(Layout.status.in_(['ready','failed']))):
+        l.status='invalidated';l.evidence=None;l.source_checksum=None
 
 def assign(s,l,ids):
     if len(ids)!=len(set(ids)):raise HTTPException(409,'测点不能重复占用通道')

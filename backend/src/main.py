@@ -9,11 +9,12 @@ from .db import Base,engine,db_session
 from .models import User,Probe,Sweep,Pressure,Layout,LayoutProbe,Audit
 from .auth import current,writers,admin,verify,token
 from .schemas import Login,ProbeInput,SweepInput,LayoutInput,Selection
-from .services import get,pack,pack_layout,pack_sweep,audit,invalidate,assign,check_sign
+from .services import get,pack,pack_layout,pack_sweep,audit,invalidate,invalidate_pending,assign,check_sign
 from .middlewares import RequestTrace,BurstGuard
 from .readiness_routes import router as readiness_router
+from .backup_routes import router as backup_router
 from .testcycle_routes import router as testcycle_router
-from .constants import ROLES,ZONES,LAYOUT_STATES
+from .constants import ROLES,ZONES,LAYOUT_STATES,SUBSTITUTION_STATES
 r=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
 async def lifespan(app):
@@ -24,7 +25,7 @@ async def lifespan(app):
             seed()
         except Exception:logging.exception('seed failed')
     yield
-app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(testcycle_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
+app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(backup_router);app.include_router(testcycle_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
 @app.exception_handler(IntegrityError)
 async def conflict(req,exc):return JSONResponse({'detail':'编号重复、测点重复或关联条件不满足，请核对'},409)
 @app.get('/health')
@@ -37,14 +38,25 @@ def login(p:Login,s=Depends(db_session)):
 @app.get('/me')
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/enums')
-def enums(u=Depends(current)):return {'roles':ROLES,'zones':ZONES,'layout_states':LAYOUT_STATES}
+def enums(u=Depends(current)):return {'roles':ROLES,'zones':ZONES,'layout_states':LAYOUT_STATES,'substitution_states':SUBSTITUTION_STATES}
 @app.get('/probes')
 def probes(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Probe).order_by(Probe.id))]
 @app.put('/probes/{pid}')
 def probe(pid:int,p:ProbeInput,s=Depends(db_session),u=Depends(writers)):
-    v=get(s,Probe,pid);invalidate(s)
+    # 先锁测点行：与开车逐点 SELECT…FOR UPDATE 串行，停用不会被并发开车放行。
+    # 已审签布置后仍允许把测点停用（停用不改变扫角来源），但标定/位置字段冻结。
+    from .calibration_service import locked
+    v=locked(s,Probe,pid)
+    signed=s.scalar(select(Layout.id).where(Layout.status=='signed'))
+    if signed:
+        changed=[k for k,val in p.model_dump().items() if val!=getattr(v,k)]
+        if any(k!='enabled' for k in changed):
+            raise HTTPException(409,'已审签布置的来源已冻结，只可停用测点，不能改标定或位置')
+        invalidate_pending(s)
+    else:
+        invalidate(s)
     for k,value in p.model_dump().items():setattr(v,k,value)
-    audit(s,u,'修订标定 '+v.code);s.commit();return pack(v)
+    audit(s,u,('停用测点 ' if not v.enabled else '修订标定 ')+v.code);s.commit();return pack(v)
 @app.get('/sweeps')
 def sweeps(s=Depends(db_session),u=Depends(current)):return [pack_sweep(s,x)for x in s.scalars(select(Sweep).order_by(Sweep.id))]
 def write_sweep(s,p,v=None):
@@ -66,6 +78,8 @@ def edit_sweep(sid:int,p:SweepInput,s=Depends(db_session),u=Depends(writers)):
     v=write_sweep(s,p,get(s,Sweep,sid));audit(s,u,'修订扫角 '+v.code);s.commit();return pack_sweep(s,v)
 @app.get('/layouts')
 def layouts(s=Depends(db_session),u=Depends(current)):return [pack_layout(s,x)for x in s.scalars(select(Layout).order_by(Layout.id.desc()))]
+@app.get('/layouts/{lid}')
+def get_layout(lid:int,s=Depends(db_session),u=Depends(current)):return pack_layout(s,get(s,Layout,lid))
 def enqueue(s,l):
     l.status='calculating';l.evidence=None;l.source_checksum=None;s.commit()
     try:r.rpush('tunnel-selection',l.id)
@@ -82,6 +96,9 @@ def reselect(lid:int,p:Selection,s=Depends(db_session),u=Depends(writers)):
 def sign(lid:int,s=Depends(db_session),u=Depends(admin)):
     l=s.query(Layout).filter_by(id=lid).with_for_update().one_or_none()
     if not l:raise HTTPException(404,'布置方案不存在')
-    check_sign(s,l);l.status='signed';l.signed_by=u.email;audit(s,u,'审签布置 '+l.code);s.commit();return pack_layout(s,l)
+    check_sign(s,l)
+    from .backup_service import sign_backups
+    sign_backups(s,l)
+    l.status='signed';l.signed_by=u.email;audit(s,u,'审签布置及随签备点 '+l.code);s.commit();return pack_layout(s,l)
 @app.get('/audits')
 def audits(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(30))]

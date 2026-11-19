@@ -11,7 +11,7 @@
 - 互信息排序：Python worker在96条训练样本内计算mutual_info_regression(seed42)，按预算自动选点，24条留出只评估回归误差；手动改点后重新回算。
 - 测点校准证书：CalibrationCertificate关联测点，记录零点/跨度误差与有效期；工程师录草稿，负责人签发，超限或过期不得签，签发后不可覆盖。
 - 风洞试验开车核对：TunnelRun只关联signed布置；开车前检查全部选点的最新签发证书、10–50m/s和−10至20°包线、三项安全联锁；负责人开车保存独立快照，工程师记录试验完结。
-- 布置审签：Layout与Probe通过LayoutProbe双外键关联。负责人必须核对三翼段覆盖、全部标定/启用、通道不超预算和来源校验。超过预算不能保存，缺翼段或未标定不能审签，拒绝不改状态。
+- 布置审签：Layout与Probe通过LayoutProbe双外键关联。负责人必须核对三翼段覆盖、全部标定/启用、通道不超预算和来源校验。超过预算不能保存，缺翼段或未标定不能审签，拒绝不改状态。审签前可登记备点，随布置一并签署（见“主测点失效与随签备点”）。
 
 标定或扫角变更使未审签布置失效；有计算中的方案暂不能改来源。第一份方案审签后整个试验来源冻结，签后方案不能改点。证据含测点快照、选点真实ID、训练/验证记录编号及来源SHA256，避免已签方案受新输入影响。
 
@@ -124,3 +124,24 @@ MIT License。
 seed只补基础测点/历史扫角/演示证书，不自动审签或制造合格采样、装夹、回执；按剧本真实操作产生追加数据。重复seed保留人工装夹修订、实际序列、冻结状态、回执和原快照。v1/v2历史证据保留，追加验证在 `../../test-artifacts/gb-1028/v3/`。没有硬件采集接口/实时流/升力反演、自动停机、撤销冻结或真实文档外发；不将人工输入示例解释为真实风洞测试数据。
 
 数据库使用READ COMMITTED，领域状态与父试验行锁继续串行化写入。采集冻结先读取批次再等试验锁，因此冻结汇总必须看到前一持锁事务最新提交的实样；不能沿用MySQL默认REPEATABLE READ在等锁前建立的旧快照。强制持锁2秒的实际并发测试验证：10Pa被重写为99Pa后冻结读到99Pa；完整采集被改成单通道后冻结拒绝，见v3/current-read-race-results.json。
+
+## 主测点失效与随签备点（v4）
+
+开车前主测点失效（停用、未标定或证书过期）时，布置不重开、不重算：工程师只能从**随布置审签的备点**里退回一个主点，负责人签发后才可用于开车。
+
+- 备点登记：布置审签前通过 `PUT /layouts/{id}/backups` 登记，须未与主测点重复、已标定且启用；`POST /layouts/{id}/sign` 审签布置时一并把备点置为 `signed`。签后不可补登或改写；旧布置没有备点时照常开车。
+- 同一时刻只换一个主点：未退回的待签或已签替换都占用名额，第二个提案/签发一律 409；`POST /layout-substitutions/{id}/withdraw` 退回原组合（已签的留下时间与操作人备注）。
+- 不增加通道：替换只做同位置替换，组合长度不变、不超过 `max_channels`，且仍须覆盖翼根/翼中/翼尖；替换测点须在已签备点内、启用、已标定且当前证书有效（按最近签发证书判定，过期不回退旧证书）。
+- 原留出集验误差：沿用原布置证据里的 `train_sweep_codes`/`holdout_sweep_codes`，不重新 split、不重看新数据。替换组合只在原训练记录上拟合 StandardScaler+Ridge(alpha=1)，再在原留出记录上算 MAE；`holdout_mae_n ≤ 原组合留出 MAE × SUBSTITUTION_ERROR_FACTOR`（默认 1.5）才算达标。提案和签发各算一次，签发时用当时数据复核，未达标拒绝签发。
+- 开车门禁：`runs_service.start` 只认「已签布置 + 至多一个已签替换」的当前组合；逐个测点 `SELECT…FOR UPDATE` 复核启用、标定与当前证书。测点停用的 `PUT /probes/{id}` 先锁同一行，与开车串行，因此并发停用不会被已开始核对的开车放行。已审签布置后仍可停用测点，但标定/位置/`zone` 等来源字段继续冻结。
+- 重试幂等：`start` 对 `running` 试验直接返回首次开车快照，不重新选点、不改换组合；采集批次按快照里的实际开车测点校验，原主点即使后来恢复启用也不能写入。
+- 页面：布置审签页显示备点签署、标定、启用、证书与当前可用性，以及替换记录（留出 MAE/阈值、达标与否、签发人）；试验开车页显示当前组合与原审签组合，并在开车快照中标注本次使用的替换。
+
+|接口|权限|
+|---|---|
+|GET /layouts/{id}/backups、GET /layout-substitutions|三角色读取|
+|PUT /layouts/{id}/backups、POST /layouts/{id}/substitutions|admin/engineer|
+|POST /layouts/{id}/sign|仅admin（含随签备点）|
+|POST /layout-substitutions/{id}/sign、/withdraw|仅admin|
+
+`backup_models.py` 为两张关系表（`layout_backups`、`layout_substitutions`），`backup_service.py` 负责备点签署、单点替换、留出误差复核与开车有效组合，`backup_routes.py` 提供权限路由。`pack_layout` 附带 `backups`/`substitutions`/`effective_probe_ids`/`active_substitution`，原 Layout 表不加列；新表用 `create_all`，历史布置与运行快照保持不变。`SUBSTITUTION_ERROR_FACTOR` 可用同名环境变量覆盖。
